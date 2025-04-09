@@ -1,0 +1,6 @@
+---
+- name: Deploy Nagios monitoring system
+  hosts: all
+  become: true
+  roles:
+    - nagios

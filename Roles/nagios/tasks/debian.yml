@@ -1,0 +1,250 @@
+---
+# tasks file for nagios
+
+- name: Check if Nagios is installed
+  command: "which nagios"
+  register: nagios_path
+  ignore_errors: true
+  failed_when: false
+
+- name: Get Nagios version number
+  shell: nagios --version | awk '/Nagios Core/ {print $3; exit}'
+  register: nagios_version
+  when: nagios_path.rc == 0
+
+- name: Set Nagios version number if Nagios is not installed
+  set_fact:
+    nagios_version: "{{ required_nagios_version }}"
+  when: nagios_path.rc != 0
+
+- name: Print message if Nagios is installed
+  debug:
+    msg: "Nagios {{ nagios_version.stdout }} is already installed on the target machine!"
+  when: nagios_path.rc == 0
+
+- name: Uninstall current version of Nagios
+  block:
+    - name: Stop Apache2 service
+      service:
+        name: apache2
+        state: stopped
+
+    - name: Remove Apache2 and its files
+      become: true
+      apt:
+        name: apache2
+        state: absent
+
+    - name: Remove Apache2 files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /etc/apache2/sites-available/nagios.conf
+        - /etc/apache2/sites-enabled/nagios.conf
+
+    - name: Stop Nagios service
+      service:
+        name: nagios
+        state: stopped
+
+    - name: Remove Nagios files and directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /usr/local/nagios
+        - /etc/nagios
+        - /tmp/nagios.tar.gz
+        - /tmp/nagios-plugins.tar.gz
+        - /tmp/nagioscore-*
+        - /tmp/nagios-*
+
+    - name: Remove Nagios user and group
+      command: userdel nagios
+      ignore_errors: true
+      failed_when: false
+    - command: groupdel nagcmd
+      ignore_errors: true
+      failed_when: false
+    - command: groupdel nagios
+      ignore_errors: true
+      failed_when: false
+
+    - name: Remove Nagios from init.d
+      shell: |
+        update-rc.d -f nagios remove
+        rm -f /etc/init.d/nagios
+
+    - name: Set Nagios Re-Installation variable if Uninstalling
+      set_fact:
+        reinstall_nagios: true
+  when:
+    - nagios_path.rc == 0
+    - required_nagios_version != nagios_version.stdout
+    - uninstall_current_version
+
+- name: Set Nagios Re-Installation variable if not Uninstalling
+  set_fact:
+    reinstall_nagios: false
+  when: reinstall_nagios is not defined
+
+- name: Check if anything is listening on port 80
+  shell: "ss -tulpn 'sport = :80'"
+  register: ss_output
+  changed_when: false
+  failed_when: false
+
+- name: Fail if port 80 is occupied by another service
+  fail:
+    msg: "Required port is occupied by a service other than apache2"
+  when:
+    - ss_output.stdout | default("") != ""
+    - "'80' in ss_output.stdout"
+    - "'apache2' not in ss_output.stdout"
+
+- name: Check UFW status
+  shell: systemctl is-active --quiet ufw && echo "UFW is running" || echo "UFW is not running"
+  register: ufw_status_result
+
+- name: Apply UFW Condition
+  block:
+    - name: Check if port 80 is open
+      wait_for:
+        host: localhost
+        port: 80
+        state: started
+        delay: 0
+        timeout: 5
+      failed_when: false
+      register: port_80_status_result
+
+    - name: Open port 80 using UFW
+      ufw:
+        rule: allow
+        port: 80
+      when: port_80_status_result.elapsed == 5
+  when:
+    - ufw_status_result.stdout == "UFW is running"
+
+- name: Nagios installation
+  block:
+    - name: Print message - Installation Started
+      debug:
+        msg: "Nagios Installation - Started"
+
+    - name: Update system packages
+      become: true
+      shell: apt update -y
+
+    - name: Install Nagios dependencies
+      become: true
+      apt:
+        name:
+          - apache2
+          - php
+          - php-gd
+          - gcc
+          - libc6
+          - libc6-dev
+          - perl
+          - libgd3
+          - libgd-dev
+          - snmp
+          - snmpd
+          - libssl-dev
+          - wget
+          - make
+          - gettext
+          - automake
+          - autoconf
+          - unzip
+        state: present
+
+    - name: Download Nagios core tarball
+      get_url:
+        url: "https://github.com/NagiosEnterprises/nagioscore/archive/nagios-{{ required_nagios_version }}.tar.gz"
+        dest: /tmp/nagios.tar.gz
+      register: nagios_download
+
+    - name: Extract Nagios core tarball
+      unarchive:
+        src: /tmp/nagios.tar.gz
+        dest: /tmp
+        remote_src: yes
+      when: nagios_download.changed
+
+    - name: Install Nagios
+      become: true
+      shell: |
+        cd /tmp/nagioscore-nagios-{{ required_nagios_version }}/
+        ./configure
+        make all
+        make install-groups-users
+        usermod -a -G nagios www-data
+        make install
+        make install-daemoninit
+        make install-commandmode
+        make install-config
+        make install-webconf
+      when: nagios_download.changed
+
+    - name: Create Nagios admin user
+      become: true
+      shell: htpasswd -b -c /usr/local/nagios/etc/htpasswd.users {{ nagios_username }} {{ nagios_password }}
+      when: nagios_download.changed
+
+    - name: Create symlink to Nagios executable
+      become: true
+      file:
+        src: /usr/local/nagios/bin/nagios
+        dest: /usr/bin/nagios
+        state: link
+      when: nagios_download.changed
+
+    - name: Download Nagios plugins tarball
+      get_url:
+        url: "https://github.com/nagios-plugins/nagios-plugins/archive/release-{{ nagios_plugins_version }}.tar.gz"
+        dest: /tmp/nagios-plugins.tar.gz
+      register: nagios_plugins_download
+
+    - name: Extract Nagios plugins tarball
+      unarchive:
+        src: /tmp/nagios-plugins.tar.gz
+        dest: /tmp
+        remote_src: yes
+      when: nagios_plugins_download.changed
+
+    - name: Install Nagios plugins
+      become: true
+      shell: |
+        cd /tmp/nagios-plugins-release-{{ nagios_plugins_version }}/
+        ./tools/setup
+        ./configure --with-nagios-user=nagios --with-nagios-group=nagios
+        make
+        make install
+      when: nagios_plugins_download.changed
+      notify:
+        - restart apache2
+        - restart nagios
+
+    - name: Check if Nagios is installed successfully
+      command: "which nagios"
+      register: new_nagios_path
+
+    - name: Get new Nagios version number
+      shell: nagios --version | awk '/Nagios Core/ {print $3; exit}'
+      register: new_nagios_version
+      when: new_nagios_path.rc == 0
+
+    - name: Print message if Nagios is installed successfully
+      debug:
+        msg: "Nagios Installation - Done"
+      when: new_nagios_path.rc == 0
+
+    - name: Fail if Nagios is not installed successfully
+      fail:
+        msg: "Nagios Installation - Failed"
+      when: new_nagios_path.rc != 0
+  when:
+    - nagios_path.rc != 0 or reinstall_nagios

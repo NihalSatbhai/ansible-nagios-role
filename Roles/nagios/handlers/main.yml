@@ -1,0 +1,17 @@
+---
+# handlers file for nagios
+
+- name: restart httpd
+  service:
+    name: httpd
+    state: restarted
+
+- name: restart apache2
+  service:
+    name: apache2
+    state: restarted
+        
+- name: restart nagios
+  service:
+    name: nagios
+    state: restarted
